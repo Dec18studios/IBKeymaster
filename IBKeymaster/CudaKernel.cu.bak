@@ -1,0 +1,186 @@
+// IBKeyer CUDA Kernel
+// On macOS: stub only (Metal is used instead)
+// On Linux/Windows: real CUDA implementation
+
+#ifndef __APPLE__
+#include <cmath>
+#include <algorithm>
+#endif
+
+#ifdef __APPLE__
+// macOS: stub out CUDA — Metal is the GPU path
+#include <cmath>
+#include <algorithm>
+#define __global__
+#define __host__
+#define __device__
+#define blockIdx (dim3{0,0,0})
+#define blockDim (dim3{1,1,1})
+#define threadIdx (dim3{0,0,0})
+struct dim3 { int x, y, z; };
+#else
+#include <cuda_runtime.h>
+#include <cmath>
+#include <cstdio>
+#endif
+
+// ── Device helpers ──────────────────────────────────────────────────────────
+
+__device__ __host__ inline void reorderChannels(float r, float g, float b, int sc,
+                                                float& c0, float& c1, float& c2)
+{
+    if (sc == 0)      { c0 = r; c1 = g; c2 = b; }
+    else if (sc == 1) { c0 = g; c1 = r; c2 = b; }
+    else              { c0 = b; c1 = r; c2 = g; }
+}
+
+__device__ __host__ inline float despillFn(float r, float g, float b,
+                                           int sc, float bias, float lim)
+{
+    float c0, c1, c2;
+    reorderChannels(r, g, b, sc, c0, c1, c2);
+    return c0 - (c1 * bias + c2 * (1.0f - bias)) * lim;
+}
+
+__device__ __host__ inline float despillNGEFn(float r, float g, float b,
+                                              int sc, float s0)
+{
+    float c0, c1, c2;
+    reorderChannels(r, g, b, sc, c0, c1, c2);
+    float mx = fmaxf(c0, fmaxf(c1, c2));
+    float comp = (mx == c1) ? c1 : c2;
+    float val = c0 * (1.0f - s0) + comp * s0;
+    return fmaxf(0.0f, fminf(1.0f, val));
+}
+
+__device__ __host__ inline float safeDivide(float a, float b)
+{
+    return (fabsf(b) > 1e-8f) ? a / b : 0.0f;
+}
+
+// ── Main kernel ─────────────────────────────────────────────────────────────
+
+__global__ void IBKeyerKernel(int p_Width, int p_Height,
+                              int p_ScreenColor, int p_UseScreenInput,
+                              float p_PickR, float p_PickG, float p_PickB,
+                              float p_Bias, float p_Limit,
+                              float p_RespillR, float p_RespillG, float p_RespillB,
+                              int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount,
+                              const float* p_Input, const float* p_Screen, float* p_Output)
+{
+#ifndef __APPLE__
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if ((x < p_Width) && (y < p_Height))
+    {
+        const int idx = ((y * p_Width) + x) * 4;
+
+        float srcR = p_Input[idx + 0];
+        float srcG = p_Input[idx + 1];
+        float srcB = p_Input[idx + 2];
+
+        float scrR, scrG, scrB;
+        if (p_UseScreenInput && p_Screen) {
+            scrR = p_Screen[idx + 0];
+            scrG = p_Screen[idx + 1];
+            scrB = p_Screen[idx + 2];
+        } else {
+            scrR = p_PickR; scrG = p_PickG; scrB = p_PickB;
+        }
+
+        float dSrc = despillFn(srcR, srcG, srcB, p_ScreenColor, p_Bias, p_Limit);
+        float dScr = despillFn(scrR, scrG, scrB, p_ScreenColor, p_Bias, p_Limit);
+        float norm = safeDivide(dSrc, dScr);
+
+        float spillMul = fmaxf(0.0f, norm);
+        float ssR = srcR - spillMul * scrR;
+        float ssG = srcG - spillMul * scrG;
+        float ssB = srcB - spillMul * scrB;
+
+        float alpha = fmaxf(0.0f, fminf(1.0f, 1.0f - norm));
+
+        if (p_NearGreyExtract) {
+            float divR = safeDivide(ssR, srcR);
+            float divG = safeDivide(ssG, srcG);
+            float divB = safeDivide(ssB, srcB);
+            float ngeA = despillNGEFn(divR, divG, divB, p_ScreenColor, p_NearGreyAmount);
+            alpha = ngeA + alpha - ngeA * alpha;
+        }
+
+        float outR = ssR;
+        float outG = ssG;
+        float outB = ssB;
+
+        float rspMul = fmaxf(0.0f, dScr * norm);
+        outR += rspMul * p_RespillR;
+        outG += rspMul * p_RespillG;
+        outB += rspMul * p_RespillB;
+
+        if (p_Premultiply) {
+            outR *= alpha;
+            outG *= alpha;
+            outB *= alpha;
+        }
+
+        p_Output[idx + 0] = outR;
+        p_Output[idx + 1] = outG;
+        p_Output[idx + 2] = outB;
+        p_Output[idx + 3] = alpha;
+    }
+#endif
+}
+
+// ── Host launch functions ───────────────────────────────────────────────────
+
+#ifdef __APPLE__
+// Stub — does nothing on macOS
+void RunCudaKernel(void* p_Stream, int p_Width, int p_Height,
+                   int p_ScreenColor, int p_UseScreenInput,
+                   float p_PickR, float p_PickG, float p_PickB,
+                   float p_Bias, float p_Limit,
+                   float p_RespillR, float p_RespillG, float p_RespillB,
+                   int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount,
+                   const float* p_Input, const float* p_Screen, float* p_Output)
+{
+    // Metal is used on macOS
+}
+
+#else
+// Real CUDA launch
+void RunCudaKernel(void* p_Stream, int p_Width, int p_Height,
+                   int p_ScreenColor, int p_UseScreenInput,
+                   float p_PickR, float p_PickG, float p_PickB,
+                   float p_Bias, float p_Limit,
+                   float p_RespillR, float p_RespillG, float p_RespillB,
+                   int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount,
+                   const float* p_Input, const float* p_Screen, float* p_Output)
+{
+    if (!p_Input || !p_Output || p_Width <= 0 || p_Height <= 0) return;
+
+    dim3 threads(16, 16, 1);
+    dim3 blocks(((p_Width + threads.x - 1) / threads.x),
+                ((p_Height + threads.y - 1) / threads.y), 1);
+    cudaStream_t stream = static_cast<cudaStream_t>(p_Stream);
+
+    IBKeyerKernel<<<blocks, threads, 0, stream>>>(
+        p_Width, p_Height,
+        p_ScreenColor, p_UseScreenInput,
+        p_PickR, p_PickG, p_PickB,
+        p_Bias, p_Limit,
+        p_RespillR, p_RespillG, p_RespillB,
+        p_Premultiply, p_NearGreyExtract, p_NearGreyAmount,
+        p_Input, p_Screen, p_Output);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("IBKeyer CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
+        return;
+    }
+    if (stream) {
+        cudaStreamSynchronize(stream);
+    } else {
+        cudaDeviceSynchronize();
+    }
+}
+#endif

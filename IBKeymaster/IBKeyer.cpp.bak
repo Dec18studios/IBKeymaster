@@ -1,0 +1,766 @@
+/////// IBKeyer OFX Plugin
+// Port of Jed Smith's IBKeyer from gaffer-tools
+// Image-Based Keyer — extracts matte + despilled foreground from a clean screen plate
+#include "IBKeyer.h"
+
+#include <stdio.h>
+#include <cmath>
+#include <algorithm>
+
+#include "ofxsImageEffect.h"
+#include "ofxsInteract.h"
+#include "ofxsMultiThread.h"
+#include "ofxsProcessing.h"
+#include "ofxsLog.h"
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+#define kPluginName "IBKeyer"
+#define kPluginGrouping "Keyer"
+#define kPluginDescription \
+    "Image-Based Keyer. Extracts a matte and despilled foreground by comparing " \
+    "source pixels against a clean screen backing plate.\n\n" \
+    "Based on IBKeyer from Jed Smith's gaffer-tools."
+#define kPluginIdentifier "com.OpenFXSample.IBKeyer"
+#define kPluginVersionMajor 1
+#define kPluginVersionMinor 0
+
+#define kSupportsTiles false
+#define kSupportsMultiResolution false
+#define kSupportsMultipleClipPARs false
+
+// Screen colour enum
+#define kScreenRed 0
+#define kScreenGreen 1
+#define kScreenBlue 2
+
+////////////////////////////////////////////////////////////////////////////////
+// IMAGE PROCESSOR CLASS
+////////////////////////////////////////////////////////////////////////////////
+
+class ImageProcessor : public OFX::ImageProcessor
+{
+public:
+    explicit ImageProcessor(OFX::ImageEffect& p_Instance);
+
+    virtual void processImagesCUDA();
+    virtual void processImagesOpenCL();
+    virtual void processImagesMetal();
+    virtual void multiThreadProcessImages(OfxRectI p_ProcWindow);
+
+    void setSrcImg(OFX::Image* p_SrcImg);
+    void setScreenImg(OFX::Image* p_ScreenImg);
+    void setScales(float p_Scale1, float p_Scale2, float p_Scale3, float p_Scale4);
+
+    void setKeyerParams(int p_ScreenColor, int p_UseScreenInput,
+                        float p_PickR, float p_PickG, float p_PickB,
+                        float p_Bias, float p_Limit,
+                        float p_RespillR, float p_RespillG, float p_RespillB,
+                        int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount);
+
+private:
+    OFX::Image* _srcImg;
+    OFX::Image* _screenImg;
+    float _scales[4];
+
+    // Keyer parameters
+    int   _screenColor;
+    int   _useScreenInput;
+    float _pickR, _pickG, _pickB;
+    float _bias;
+    float _limit;
+    float _respillR, _respillG, _respillB;
+    int   _premultiply;
+    int   _nearGreyExtract;
+    float _nearGreyAmount;
+
+    // Helper: reorder channels based on screen colour
+    inline void reorder(float r, float g, float b,
+                        float& c0, float& c1, float& c2) const
+    {
+        switch (_screenColor) {
+            case kScreenRed:   c0 = r; c1 = g; c2 = b; break;
+            case kScreenGreen: c0 = g; c1 = r; c2 = b; break;
+            case kScreenBlue:
+            default:           c0 = b; c1 = r; c2 = g; break;
+        }
+    }
+
+    // Standard despill: c0 - (c1 * bias + c2 * (1 - bias)) * limit
+    inline float despill(float r, float g, float b) const
+    {
+        float c0, c1, c2;
+        reorder(r, g, b, c0, c1, c2);
+        return c0 - (c1 * _bias + c2 * (1.0f - _bias)) * _limit;
+    }
+
+    // Near-grey despill mode
+    inline float despillNGE(float r, float g, float b) const
+    {
+        float c0, c1, c2;
+        reorder(r, g, b, c0, c1, c2);
+        float s0 = _nearGreyAmount;
+        float mx = fmaxf(c0, fmaxf(c1, c2));
+        float comp = (mx == c1) ? c1 : c2;
+        float val = c0 * (1.0f - s0) + comp * s0;
+        return fmaxf(0.0f, fminf(1.0f, val));
+    }
+
+    static inline float safeDivide(float a, float b)
+    {
+        return (fabsf(b) > 1e-8f) ? a / b : 0.0f;
+    }
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// IMAGE PROCESSOR IMPLEMENTATION
+////////////////////////////////////////////////////////////////////////////////
+
+ImageProcessor::ImageProcessor(OFX::ImageEffect& p_Instance)
+    : OFX::ImageProcessor(p_Instance)
+{
+}
+
+void ImageProcessor::setSrcImg(OFX::Image* p_SrcImg)
+{
+    _srcImg = p_SrcImg;
+}
+
+void ImageProcessor::setScreenImg(OFX::Image* p_ScreenImg)
+{
+    _screenImg = p_ScreenImg;
+}
+
+void ImageProcessor::setScales(float p_Scale1, float p_Scale2, float p_Scale3, float p_Scale4)
+{
+    _scales[0] = p_Scale1;
+    _scales[1] = p_Scale2;
+    _scales[2] = p_Scale3;
+    _scales[3] = p_Scale4;
+}
+
+void ImageProcessor::setKeyerParams(int p_ScreenColor, int p_UseScreenInput,
+                                    float p_PickR, float p_PickG, float p_PickB,
+                                    float p_Bias, float p_Limit,
+                                    float p_RespillR, float p_RespillG, float p_RespillB,
+                                    int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount)
+{
+    _screenColor     = p_ScreenColor;
+    _useScreenInput  = p_UseScreenInput;
+    _pickR = p_PickR; _pickG = p_PickG; _pickB = p_PickB;
+    _bias            = p_Bias;
+    _limit           = p_Limit;
+    _respillR = p_RespillR; _respillG = p_RespillG; _respillB = p_RespillB;
+    _premultiply     = p_Premultiply;
+    _nearGreyExtract = p_NearGreyExtract;
+    _nearGreyAmount  = p_NearGreyAmount;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// GPU PROCESSING — EXTERNAL KERNEL DECLARATIONS
+////////////////////////////////////////////////////////////////////////////////
+
+#ifndef __APPLE__
+extern void RunCudaKernel(void* p_Stream, int p_Width, int p_Height,
+                          int p_ScreenColor, int p_UseScreenInput,
+                          float p_PickR, float p_PickG, float p_PickB,
+                          float p_Bias, float p_Limit,
+                          float p_RespillR, float p_RespillG, float p_RespillB,
+                          int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount,
+                          const float* p_Input, const float* p_Screen, float* p_Output);
+#endif
+
+#ifdef __APPLE__
+extern void RunMetalKernel(void* p_CmdQ, int p_Width, int p_Height,
+                           int p_ScreenColor, int p_UseScreenInput,
+                           float p_PickR, float p_PickG, float p_PickB,
+                           float p_Bias, float p_Limit,
+                           float p_RespillR, float p_RespillG, float p_RespillB,
+                           int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount,
+                           const float* p_Input, const float* p_Screen, float* p_Output);
+#endif
+
+extern void RunOpenCLKernel(void* p_CmdQ, int p_Width, int p_Height,
+                            int p_ScreenColor, int p_UseScreenInput,
+                            float p_PickR, float p_PickG, float p_PickB,
+                            float p_Bias, float p_Limit,
+                            float p_RespillR, float p_RespillG, float p_RespillB,
+                            int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount,
+                            const float* p_Input, const float* p_Screen, float* p_Output);
+
+////////////////////////////////////////////////////////////////////////////////
+// GPU DISPATCH METHODS
+////////////////////////////////////////////////////////////////////////////////
+
+void ImageProcessor::processImagesCUDA()
+{
+#ifndef __APPLE__
+    const OfxRectI& bounds = _srcImg->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
+
+    float* input = static_cast<float*>(_srcImg->getPixelData());
+    float* output = static_cast<float*>(_dstImg->getPixelData());
+    float* screen = (_screenImg && _useScreenInput) ? static_cast<float*>(_screenImg->getPixelData()) : nullptr;
+
+    RunCudaKernel(_pCudaStream, width, height,
+                  _screenColor, _useScreenInput,
+                  _pickR, _pickG, _pickB,
+                  _bias, _limit,
+                  _respillR, _respillG, _respillB,
+                  _premultiply, _nearGreyExtract, _nearGreyAmount,
+                  input, screen, output);
+#endif
+}
+
+void ImageProcessor::processImagesMetal()
+{
+#ifdef __APPLE__
+    const OfxRectI& bounds = _srcImg->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
+
+    float* input = static_cast<float*>(_srcImg->getPixelData());
+    float* output = static_cast<float*>(_dstImg->getPixelData());
+    float* screen = (_screenImg && _useScreenInput) ? static_cast<float*>(_screenImg->getPixelData()) : nullptr;
+
+    RunMetalKernel(_pMetalCmdQ, width, height,
+                   _screenColor, _useScreenInput,
+                   _pickR, _pickG, _pickB,
+                   _bias, _limit,
+                   _respillR, _respillG, _respillB,
+                   _premultiply, _nearGreyExtract, _nearGreyAmount,
+                   input, screen, output);
+#endif
+}
+
+void ImageProcessor::processImagesOpenCL()
+{
+    const OfxRectI& bounds = _srcImg->getBounds();
+    const int width = bounds.x2 - bounds.x1;
+    const int height = bounds.y2 - bounds.y1;
+
+    float* input = static_cast<float*>(_srcImg->getPixelData());
+    float* output = static_cast<float*>(_dstImg->getPixelData());
+    float* screen = (_screenImg && _useScreenInput) ? static_cast<float*>(_screenImg->getPixelData()) : nullptr;
+
+    RunOpenCLKernel(_pOpenCLCmdQ, width, height,
+                    _screenColor, _useScreenInput,
+                    _pickR, _pickG, _pickB,
+                    _bias, _limit,
+                    _respillR, _respillG, _respillB,
+                    _premultiply, _nearGreyExtract, _nearGreyAmount,
+                    input, screen, output);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// CPU PROCESSING — FALLBACK
+////////////////////////////////////////////////////////////////////////////////
+
+void ImageProcessor::multiThreadProcessImages(OfxRectI p_ProcWindow)
+{
+    for (int y = p_ProcWindow.y1; y < p_ProcWindow.y2; ++y)
+    {
+        if (_effect.abort()) break;
+
+        float* dstPix = static_cast<float*>(_dstImg->getPixelAddress(p_ProcWindow.x1, y));
+
+        for (int x = p_ProcWindow.x1; x < p_ProcWindow.x2; ++x)
+        {
+            float* srcPix = static_cast<float*>(_srcImg ? _srcImg->getPixelAddress(x, y) : 0);
+
+            if (srcPix)
+            {
+                float srcR = srcPix[0];
+                float srcG = srcPix[1];
+                float srcB = srcPix[2];
+                // srcPix[3] = source alpha (not used by algorithm)
+
+                // Get screen colour: from screen clip or constant pick
+                float scrR, scrG, scrB;
+                if (_useScreenInput && _screenImg)
+                {
+                    float* scrPix = static_cast<float*>(_screenImg->getPixelAddress(x, y));
+                    if (scrPix) {
+                        scrR = scrPix[0]; scrG = scrPix[1]; scrB = scrPix[2];
+                    } else {
+                        scrR = _pickR; scrG = _pickG; scrB = _pickB;
+                    }
+                }
+                else
+                {
+                    scrR = _pickR; scrG = _pickG; scrB = _pickB;
+                }
+
+                // 1. Despill of source and screen
+                float despillRGB    = despill(srcR, srcG, srcB);
+                float despillScreen = despill(scrR, scrG, scrB);
+
+                // 2. Normalise
+                float normalized = safeDivide(despillRGB, despillScreen);
+
+                // 3. Spill map and screen subtraction
+                float spillMul = fmaxf(0.0f, normalized);
+                float ssR = srcR - spillMul * scrR;
+                float ssG = srcG - spillMul * scrG;
+                float ssB = srcB - spillMul * scrB;
+
+                // 4. Initial alpha
+                float alpha = fmaxf(0.0f, fminf(1.0f, 1.0f - normalized));
+
+                // 5. Near Grey Extraction (optional)
+                if (_nearGreyExtract)
+                {
+                    float divR = safeDivide(ssR, srcR);
+                    float divG = safeDivide(ssG, srcG);
+                    float divB = safeDivide(ssB, srcB);
+                    float ngeAlpha = despillNGE(divR, divG, divB);
+                    // Screen composite: a + b - a*b
+                    alpha = ngeAlpha + alpha - ngeAlpha * alpha;
+                }
+
+                // 6. Output = screen-subtracted + respill
+                float outR = ssR;
+                float outG = ssG;
+                float outB = ssB;
+
+                float respillMul = fmaxf(0.0f, despillScreen * normalized);
+                outR += respillMul * _respillR;
+                outG += respillMul * _respillG;
+                outB += respillMul * _respillB;
+
+                // 7. Optional premultiply
+                if (_premultiply)
+                {
+                    outR *= alpha;
+                    outG *= alpha;
+                    outB *= alpha;
+                }
+
+                dstPix[0] = outR;
+                dstPix[1] = outG;
+                dstPix[2] = outB;
+                dstPix[3] = alpha;
+            }
+            else
+            {
+                dstPix[0] = 0;
+                dstPix[1] = 0;
+                dstPix[2] = 0;
+                dstPix[3] = 0;
+            }
+            dstPix += 4;
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// MAIN PLUGIN CLASS
+////////////////////////////////////////////////////////////////////////////////
+
+class IBKeyer : public OFX::ImageEffect
+{
+public:
+    explicit IBKeyer(OfxImageEffectHandle p_Handle);
+
+    virtual void render(const OFX::RenderArguments& p_Args);
+    virtual bool isIdentity(const OFX::IsIdentityArguments& p_Args, OFX::Clip*& p_IdentityClip, double& p_IdentityTime);
+    virtual void changedParam(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ParamName);
+    virtual void changedClip(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ClipName);
+
+    void setEnabledness();
+    void setupAndProcess(ImageProcessor& p_Processor, const OFX::RenderArguments& p_Args);
+
+private:
+    // Clips
+    OFX::Clip* m_DstClip;
+    OFX::Clip* m_SrcClip;
+    OFX::Clip* m_ScreenClip;
+
+    // Parameters
+    OFX::ChoiceParam*   m_ScreenColor;
+    OFX::BooleanParam*  m_UseScreenInput;
+    OFX::RGBParam*      m_PickColor;
+    OFX::DoubleParam*   m_Bias;
+    OFX::DoubleParam*   m_Limit;
+    OFX::RGBParam*      m_RespillColor;
+    OFX::BooleanParam*  m_Premultiply;
+    OFX::BooleanParam*  m_NearGreyExtract;
+    OFX::DoubleParam*   m_NearGreyAmount;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// PLUGIN CONSTRUCTOR
+////////////////////////////////////////////////////////////////////////////////
+
+IBKeyer::IBKeyer(OfxImageEffectHandle p_Handle)
+    : ImageEffect(p_Handle)
+{
+    m_DstClip    = fetchClip(kOfxImageEffectOutputClipName);
+    m_SrcClip    = fetchClip(kOfxImageEffectSimpleSourceClipName);
+    m_ScreenClip = fetchClip("Screen");
+
+    m_ScreenColor     = fetchChoiceParam("screenColor");
+    m_UseScreenInput  = fetchBooleanParam("useScreenInput");
+    m_PickColor       = fetchRGBParam("pickColor");
+    m_Bias            = fetchDoubleParam("bias");
+    m_Limit           = fetchDoubleParam("limit");
+    m_RespillColor    = fetchRGBParam("respillColor");
+    m_Premultiply     = fetchBooleanParam("premultiply");
+    m_NearGreyExtract = fetchBooleanParam("nearGreyExtract");
+    m_NearGreyAmount  = fetchDoubleParam("nearGreyAmount");
+
+    setEnabledness();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// RENDER
+////////////////////////////////////////////////////////////////////////////////
+
+void IBKeyer::render(const OFX::RenderArguments& p_Args)
+{
+    if ((m_DstClip->getPixelDepth() == OFX::eBitDepthFloat) &&
+        (m_DstClip->getPixelComponents() == OFX::ePixelComponentRGBA))
+    {
+        ImageProcessor processor(*this);
+        setupAndProcess(processor, p_Args);
+    }
+    else
+    {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// IDENTITY CHECK
+////////////////////////////////////////////////////////////////////////////////
+
+bool IBKeyer::isIdentity(const OFX::IsIdentityArguments& p_Args, OFX::Clip*& p_IdentityClip, double& p_IdentityTime)
+{
+    // No identity case for a keyer — it always modifies the alpha channel
+    return false;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// PARAMETER CHANGE HANDLER
+////////////////////////////////////////////////////////////////////////////////
+
+void IBKeyer::changedParam(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ParamName)
+{
+    if (p_ParamName == "useScreenInput")
+    {
+        setEnabledness();
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// CLIP CHANGE HANDLER
+////////////////////////////////////////////////////////////////////////////////
+
+void IBKeyer::changedClip(const OFX::InstanceChangedArgs& p_Args, const std::string& p_ClipName)
+{
+    if (p_ClipName == kOfxImageEffectSimpleSourceClipName)
+    {
+        setEnabledness();
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// UI CONTROL ENABLEMENT
+////////////////////////////////////////////////////////////////////////////////
+
+void IBKeyer::setEnabledness()
+{
+    bool useScrIn = m_UseScreenInput->getValue();
+    m_PickColor->setEnabled(!useScrIn);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// SETUP AND PROCESS
+////////////////////////////////////////////////////////////////////////////////
+
+void IBKeyer::setupAndProcess(ImageProcessor& p_Processor, const OFX::RenderArguments& p_Args)
+{
+    // Get output image
+    OFX::Image* dst = m_DstClip->fetchImage(p_Args.time);
+    OFX::BitDepthEnum dstBitDepth = dst->getPixelDepth();
+    OFX::PixelComponentEnum dstComponents = dst->getPixelComponents();
+
+    // Get source image
+    OFX::Image* src = m_SrcClip->fetchImage(p_Args.time);
+    OFX::BitDepthEnum srcBitDepth = src->getPixelDepth();
+    OFX::PixelComponentEnum srcComponents = src->getPixelComponents();
+
+    if ((srcBitDepth != dstBitDepth) || (srcComponents != dstComponents))
+    {
+        OFX::throwSuiteStatusException(kOfxStatErrValue);
+    }
+
+    // Get screen image (optional clip)
+    OFX::Image* screen = nullptr;
+    if (m_ScreenClip && m_ScreenClip->isConnected())
+    {
+        screen = m_ScreenClip->fetchImage(p_Args.time);
+    }
+
+    // Fetch parameter values
+    int screenColor;
+    m_ScreenColor->getValueAtTime(p_Args.time, screenColor);
+    bool useScreenInput = m_UseScreenInput->getValueAtTime(p_Args.time);
+
+    double pickR, pickG, pickB;
+    m_PickColor->getValueAtTime(p_Args.time, pickR, pickG, pickB);
+
+    double bias = m_Bias->getValueAtTime(p_Args.time);
+    double limit = m_Limit->getValueAtTime(p_Args.time);
+
+    double respillR, respillG, respillB;
+    m_RespillColor->getValueAtTime(p_Args.time, respillR, respillG, respillB);
+
+    bool premultiply = m_Premultiply->getValueAtTime(p_Args.time);
+    bool nearGreyExtract = m_NearGreyExtract->getValueAtTime(p_Args.time);
+    double nearGreyAmount = m_NearGreyAmount->getValueAtTime(p_Args.time);
+
+    // Configure processor
+    p_Processor.setDstImg(dst);
+    p_Processor.setSrcImg(src);
+    p_Processor.setScreenImg(screen);
+    p_Processor.setGPURenderArgs(p_Args);
+    p_Processor.setRenderWindow(p_Args.renderWindow);
+
+    p_Processor.setKeyerParams(
+        screenColor, useScreenInput ? 1 : 0,
+        (float)pickR, (float)pickG, (float)pickB,
+        (float)bias, (float)limit,
+        (float)respillR, (float)respillG, (float)respillB,
+        premultiply ? 1 : 0, nearGreyExtract ? 1 : 0, (float)nearGreyAmount);
+
+    p_Processor.process();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// PLUGIN FACTORY
+////////////////////////////////////////////////////////////////////////////////
+
+using namespace OFX;
+
+IBKeyerFactory::IBKeyerFactory()
+    : OFX::PluginFactoryHelper<IBKeyerFactory>(kPluginIdentifier, kPluginVersionMajor, kPluginVersionMinor)
+{
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DESCRIBE
+////////////////////////////////////////////////////////////////////////////////
+
+void IBKeyerFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
+{
+    p_Desc.setLabels(kPluginName, kPluginName, kPluginName);
+    p_Desc.setPluginGrouping(kPluginGrouping);
+    p_Desc.setPluginDescription(kPluginDescription);
+
+    p_Desc.addSupportedContext(eContextFilter);
+    p_Desc.addSupportedContext(eContextGeneral);
+    p_Desc.addSupportedBitDepth(eBitDepthFloat);
+
+    p_Desc.setSingleInstance(false);
+    p_Desc.setHostFrameThreading(false);
+    p_Desc.setSupportsMultiResolution(kSupportsMultiResolution);
+    p_Desc.setSupportsTiles(kSupportsTiles);
+    p_Desc.setTemporalClipAccess(false);
+    p_Desc.setRenderTwiceAlways(false);
+    p_Desc.setSupportsMultipleClipPARs(kSupportsMultipleClipPARs);
+
+    // GPU support
+    p_Desc.setSupportsOpenCLRender(true);
+#ifndef __APPLE__
+    p_Desc.setSupportsCudaRender(true);
+    p_Desc.setSupportsCudaStream(true);
+#endif
+#ifdef __APPLE__
+    p_Desc.setSupportsMetalRender(true);
+#endif
+
+    p_Desc.setNoSpatialAwareness(true);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DESCRIBE IN CONTEXT — CLIPS + PARAMETERS
+////////////////////////////////////////////////////////////////////////////////
+
+static DoubleParamDescriptor* defineDoubleParam(OFX::ImageEffectDescriptor& p_Desc,
+                                                const std::string& p_Name,
+                                                const std::string& p_Label,
+                                                const std::string& p_Hint,
+                                                GroupParamDescriptor* p_Parent = nullptr,
+                                                double defaultValue = 1.0,
+                                                double minValue = 0.0,
+                                                double maxValue = 10.0,
+                                                double increment = 0.01)
+{
+    DoubleParamDescriptor* param = p_Desc.defineDoubleParam(p_Name);
+    param->setLabels(p_Label, p_Label, p_Label);
+    param->setScriptName(p_Name);
+    param->setHint(p_Hint);
+    param->setDefault(defaultValue);
+    param->setRange(minValue, maxValue);
+    param->setIncrement(increment);
+    param->setDisplayRange(minValue, maxValue);
+    param->setDoubleType(eDoubleTypePlain);
+    if (p_Parent) { param->setParent(*p_Parent); }
+    return param;
+}
+
+void IBKeyerFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, OFX::ContextEnum /*p_Context*/)
+{
+    // Source clip (foreground)
+    ClipDescriptor* srcClip = p_Desc.defineClip(kOfxImageEffectSimpleSourceClipName);
+    srcClip->addSupportedComponent(ePixelComponentRGBA);
+    srcClip->setTemporalClipAccess(false);
+    srcClip->setSupportsTiles(kSupportsTiles);
+    srcClip->setIsMask(false);
+
+    // Screen clip (optional clean plate)
+    ClipDescriptor* screenClip = p_Desc.defineClip("Screen");
+    screenClip->addSupportedComponent(ePixelComponentRGBA);
+    screenClip->addSupportedComponent(ePixelComponentRGB);
+    screenClip->setTemporalClipAccess(false);
+    screenClip->setSupportsTiles(kSupportsTiles);
+    screenClip->setOptional(true);
+    screenClip->setIsMask(false);
+
+    // Output clip
+    ClipDescriptor* dstClip = p_Desc.defineClip(kOfxImageEffectOutputClipName);
+    dstClip->addSupportedComponent(ePixelComponentRGBA);
+    dstClip->addSupportedComponent(ePixelComponentAlpha);
+    dstClip->setSupportsTiles(kSupportsTiles);
+
+    // Page
+    PageParamDescriptor* page = p_Desc.definePageParam("Controls");
+
+    // Group: Screen Settings
+    GroupParamDescriptor* screenGroup = p_Desc.defineGroupParam("ScreenGroup");
+    screenGroup->setHint("Screen and keying parameters");
+    screenGroup->setLabels("Screen Settings", "Screen Settings", "Screen Settings");
+
+    // Screen colour choice (Red / Green / Blue)
+    {
+        ChoiceParamDescriptor* param = p_Desc.defineChoiceParam("screenColor");
+        param->setLabel("Screen Color");
+        param->setHint("Dominant chroma of the backing screen.");
+        param->appendOption("Red");
+        param->appendOption("Green");
+        param->appendOption("Blue");
+        param->setDefault(kScreenBlue);
+        param->setAnimates(true);
+        param->setParent(*screenGroup);
+        page->addChild(*param);
+    }
+
+    // Use screen input toggle
+    {
+        BooleanParamDescriptor* param = p_Desc.defineBooleanParam("useScreenInput");
+        param->setDefault(true);
+        param->setHint("When enabled, reads screen colour from the Screen clip. "
+                        "When disabled, uses the Pick Color constant.");
+        param->setLabels("Use Screen Input", "Use Screen Input", "Use Screen Input");
+        param->setParent(*screenGroup);
+        page->addChild(*param);
+    }
+
+    // Pick colour (constant fallback)
+    {
+        RGBParamDescriptor* param = p_Desc.defineRGBParam("pickColor");
+        param->setLabels("Pick Color", "Pick Color", "Pick Color");
+        param->setHint("Constant screen colour when Screen input is not connected.");
+        param->setDefault(0.0, 0.0, 0.0);
+        param->setParent(*screenGroup);
+        page->addChild(*param);
+    }
+
+    // Group: Keyer Controls
+    GroupParamDescriptor* keyerGroup = p_Desc.defineGroupParam("KeyerGroup");
+    keyerGroup->setHint("Keying and despill controls");
+    keyerGroup->setLabels("Keyer Controls", "Keyer Controls", "Keyer Controls");
+
+    // Bias
+    {
+        DoubleParamDescriptor* param = defineDoubleParam(p_Desc, "bias", "Bias",
+            "Weighting between the two complement channels. "
+            "0.5 = equal weight.",
+            keyerGroup, 0.5, 0.0, 1.0, 0.01);
+        page->addChild(*param);
+    }
+
+    // Limit
+    {
+        DoubleParamDescriptor* param = defineDoubleParam(p_Desc, "limit", "Limit",
+            "Scales the despill subtraction. 1.0 = standard.",
+            keyerGroup, 1.0, 0.0, 5.0, 0.01);
+        page->addChild(*param);
+    }
+
+    // Respill colour
+    {
+        RGBParamDescriptor* param = p_Desc.defineRGBParam("respillColor");
+        param->setLabels("Respill Color", "Respill Color", "Respill Color");
+        param->setHint("Colour to add back where screen spill was removed. "
+                        "(0,0,0) for pure IBK-style extraction.");
+        param->setDefault(0.0, 0.0, 0.0);
+        param->setParent(*keyerGroup);
+        page->addChild(*param);
+    }
+
+    // Premultiply
+    {
+        BooleanParamDescriptor* param = p_Desc.defineBooleanParam("premultiply");
+        param->setDefault(false);
+        param->setHint("Premultiply RGB by alpha.\n"
+                        "Off + respill=0: IBK-style extraction.\n"
+                        "On + tweak respill: good edges for compositing.");
+        param->setLabels("Premultiply", "Premultiply", "Premultiply");
+        param->setParent(*keyerGroup);
+        page->addChild(*param);
+    }
+
+    // Group: Near Grey Extract
+    GroupParamDescriptor* ngeGroup = p_Desc.defineGroupParam("NGEGroup");
+    ngeGroup->setHint("Near Grey Extraction controls");
+    ngeGroup->setLabels("Near Grey Extract", "Near Grey Extract", "Near Grey Extract");
+
+    // Near Grey Extract toggle
+    {
+        BooleanParamDescriptor* param = p_Desc.defineBooleanParam("nearGreyExtract");
+        param->setDefault(true);
+        param->setHint("Improves matte quality in near-grey or ambiguous areas.");
+        param->setLabels("Enable", "Enable", "Enable");
+        param->setParent(*ngeGroup);
+        page->addChild(*param);
+    }
+
+    // Near Grey Amount
+    {
+        DoubleParamDescriptor* param = defineDoubleParam(p_Desc, "nearGreyAmount", "Amount",
+            "Strength of the near-grey extraction.",
+            ngeGroup, 1.0, 0.0, 1.0, 0.01);
+        page->addChild(*param);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// CREATE INSTANCE
+////////////////////////////////////////////////////////////////////////////////
+
+ImageEffect* IBKeyerFactory::createInstance(OfxImageEffectHandle p_Handle, ContextEnum /*p_Context*/)
+{
+    return new IBKeyer(p_Handle);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// PLUGIN REGISTRATION
+////////////////////////////////////////////////////////////////////////////////
+
+void OFX::Plugin::getPluginIDs(PluginFactoryArray& p_FactoryArray)
+{
+    static IBKeyerFactory ibKeyer;
+    p_FactoryArray.push_back(&ibKeyer);
+}

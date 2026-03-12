@@ -1,0 +1,298 @@
+#import <Metal/Metal.h>
+
+#include <unordered_map>
+#include <mutex>
+
+/*
+ * IBKeyer Metal Kernel
+ * Port of Jed Smith's IBKeyer from gaffer-tools
+ *
+ * Buffer index convention (matching your OFX template):
+ *   0  = Source input image (RGBA float)
+ *   1  = Screen input image (RGBA float, may be null — uses pick colour)
+ *   8  = Output image (RGBA float)
+ *   11 = width (int)
+ *   12 = height (int)
+ *   13 = screenColor (int: 0=Red, 1=Green, 2=Blue)
+ *   14 = useScreenInput (int: 0 or 1)
+ *   15 = pickR (float)
+ *   16 = pickG (float)
+ *   17 = pickB (float)
+ *   18 = bias (float)
+ *   19 = limit (float)
+ *   20 = respillR (float)
+ *   21 = respillG (float)
+ *   22 = respillB (float)
+ *   23 = premultiply (int: 0 or 1)
+ *   24 = nearGreyExtract (int: 0 or 1)
+ *   25 = nearGreyAmount (float)
+ */
+
+const char* kernelSource =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"\n"
+"// ── Helper: reorder channels based on screen colour ──────────────────\n"
+"inline void reorderChannels(float r, float g, float b, int sc,\n"
+"                            thread float& c0, thread float& c1, thread float& c2)\n"
+"{\n"
+"    if (sc == 0)      { c0 = r; c1 = g; c2 = b; }\n"
+"    else if (sc == 1) { c0 = g; c1 = r; c2 = b; }\n"
+"    else              { c0 = b; c1 = r; c2 = g; }\n"
+"}\n"
+"\n"
+"// ── Standard despill ─────────────────────────────────────────────────\n"
+"inline float despill(float r, float g, float b, int sc, float bias, float lim)\n"
+"{\n"
+"    float c0, c1, c2;\n"
+"    reorderChannels(r, g, b, sc, c0, c1, c2);\n"
+"    return c0 - (c1 * bias + c2 * (1.0f - bias)) * lim;\n"
+"}\n"
+"\n"
+"// ── Near-grey despill mode ───────────────────────────────────────────\n"
+"inline float despillNGE(float r, float g, float b, int sc, float s0)\n"
+"{\n"
+"    float c0, c1, c2;\n"
+"    reorderChannels(r, g, b, sc, c0, c1, c2);\n"
+"    float mx = max(c0, max(c1, c2));\n"
+"    float comp = (mx == c1) ? c1 : c2;\n"
+"    return clamp(c0 * (1.0f - s0) + comp * s0, 0.0f, 1.0f);\n"
+"}\n"
+"\n"
+"// ── Safe divide ─────────────────────────────────────────────────────\n"
+"inline float safeDivide(float a, float b)\n"
+"{\n"
+"    return (abs(b) > 1e-8f) ? a / b : 0.0f;\n"
+"}\n"
+"\n"
+"// ═══════════════════════════════════════════════════════════════════════\n"
+"//  Main Kernel\n"
+"// ═══════════════════════════════════════════════════════════════════════\n"
+"kernel void IBKeyerKernel(\n"
+"    const device float* p_Input      [[buffer(0)]],\n"
+"    const device float* p_Screen     [[buffer(1)]],\n"
+"    device float*       p_Output     [[buffer(8)]],\n"
+"    constant int&       p_Width      [[buffer(11)]],\n"
+"    constant int&       p_Height     [[buffer(12)]],\n"
+"    constant int&       p_ScreenColor     [[buffer(13)]],\n"
+"    constant int&       p_UseScreenInput  [[buffer(14)]],\n"
+"    constant float&     p_PickR      [[buffer(15)]],\n"
+"    constant float&     p_PickG      [[buffer(16)]],\n"
+"    constant float&     p_PickB      [[buffer(17)]],\n"
+"    constant float&     p_Bias       [[buffer(18)]],\n"
+"    constant float&     p_Limit      [[buffer(19)]],\n"
+"    constant float&     p_RespillR   [[buffer(20)]],\n"
+"    constant float&     p_RespillG   [[buffer(21)]],\n"
+"    constant float&     p_RespillB   [[buffer(22)]],\n"
+"    constant int&       p_Premultiply     [[buffer(23)]],\n"
+"    constant int&       p_NearGreyExtract [[buffer(24)]],\n"
+"    constant float&     p_NearGreyAmount  [[buffer(25)]],\n"
+"    uint2 id [[thread_position_in_grid]])\n"
+"{\n"
+"    if ((int)id.x >= p_Width || (int)id.y >= p_Height) return;\n"
+"\n"
+"    const int idx = ((id.y * p_Width) + id.x) * 4;\n"
+"\n"
+"    // Source pixel\n"
+"    float srcR = p_Input[idx + 0];\n"
+"    float srcG = p_Input[idx + 1];\n"
+"    float srcB = p_Input[idx + 2];\n"
+"\n"
+"    // Screen pixel: from screen buffer or constant pick colour\n"
+"    float scrR, scrG, scrB;\n"
+"    if (p_UseScreenInput != 0 && p_Screen != nullptr) {\n"
+"        scrR = p_Screen[idx + 0];\n"
+"        scrG = p_Screen[idx + 1];\n"
+"        scrB = p_Screen[idx + 2];\n"
+"    } else {\n"
+"        scrR = p_PickR;\n"
+"        scrG = p_PickG;\n"
+"        scrB = p_PickB;\n"
+"    }\n"
+"\n"
+"    int sc = p_ScreenColor;\n"
+"    float bias = p_Bias;\n"
+"    float lim  = p_Limit;\n"
+"\n"
+"    // 1. Despill source and screen\n"
+"    float dSrc = despill(srcR, srcG, srcB, sc, bias, lim);\n"
+"    float dScr = despill(scrR, scrG, scrB, sc, bias, lim);\n"
+"\n"
+"    // 2. Normalise\n"
+"    float norm = safeDivide(dSrc, dScr);\n"
+"\n"
+"    // 3. Spill map + screen subtraction\n"
+"    float spillMul = max(0.0f, norm);\n"
+"    float ssR = srcR - spillMul * scrR;\n"
+"    float ssG = srcG - spillMul * scrG;\n"
+"    float ssB = srcB - spillMul * scrB;\n"
+"\n"
+"    // 4. Initial alpha\n"
+"    float alpha = clamp(1.0f - norm, 0.0f, 1.0f);\n"
+"\n"
+"    // 5. Near Grey Extraction\n"
+"    if (p_NearGreyExtract != 0) {\n"
+"        float divR = safeDivide(ssR, srcR);\n"
+"        float divG = safeDivide(ssG, srcG);\n"
+"        float divB = safeDivide(ssB, srcB);\n"
+"        float ngeA = despillNGE(divR, divG, divB, sc, p_NearGreyAmount);\n"
+"        alpha = ngeA + alpha - ngeA * alpha;\n"
+"    }\n"
+"\n"
+"    // 6. Output = screen-subtracted + respill\n"
+"    float outR = ssR;\n"
+"    float outG = ssG;\n"
+"    float outB = ssB;\n"
+"\n"
+"    float rspMul = max(0.0f, dScr * norm);\n"
+"    outR += rspMul * p_RespillR;\n"
+"    outG += rspMul * p_RespillG;\n"
+"    outB += rspMul * p_RespillB;\n"
+"\n"
+"    // 7. Optional premultiply\n"
+"    if (p_Premultiply != 0) {\n"
+"        outR *= alpha;\n"
+"        outG *= alpha;\n"
+"        outB *= alpha;\n"
+"    }\n"
+"\n"
+"    p_Output[idx + 0] = outR;\n"
+"    p_Output[idx + 1] = outG;\n"
+"    p_Output[idx + 2] = outB;\n"
+"    p_Output[idx + 3] = alpha;\n"
+"}\n";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Pipeline cache + dispatch
+// ═══════════════════════════════════════════════════════════════════════════════
+
+std::mutex s_PipelineQueueMutex;
+typedef std::unordered_map<id<MTLCommandQueue>, id<MTLComputePipelineState>> PipelineQueueMap;
+PipelineQueueMap s_PipelineQueueMap;
+
+void RunMetalKernel(void* p_CmdQ, int p_Width, int p_Height,
+                    int p_ScreenColor, int p_UseScreenInput,
+                    float p_PickR, float p_PickG, float p_PickB,
+                    float p_Bias, float p_Limit,
+                    float p_RespillR, float p_RespillG, float p_RespillB,
+                    int p_Premultiply, int p_NearGreyExtract, float p_NearGreyAmount,
+                    const float* p_Input, const float* p_Screen, float* p_Output)
+{
+    const char* kernelName = "IBKeyerKernel";
+
+    id<MTLCommandQueue> queue = static_cast<id<MTLCommandQueue>>(p_CmdQ);
+    id<MTLDevice> device = queue.device;
+    id<MTLLibrary> metalLibrary = nil;
+    id<MTLFunction> kernelFunction = nil;
+    id<MTLComputePipelineState> pipelineState = nil;
+    NSError* err = nil;
+
+    std::unique_lock<std::mutex> lock(s_PipelineQueueMutex);
+
+    auto it = s_PipelineQueueMap.find(queue);
+    if (it == s_PipelineQueueMap.end()) {
+        MTLCompileOptions* options = [MTLCompileOptions new];
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+        options.mathMode = MTLMathModeFast;
+#else
+        options.fastMathEnabled = YES;
+#endif
+
+        metalLibrary = [device newLibraryWithSource:@(kernelSource) options:options error:&err];
+        [options release];
+        if (!metalLibrary) {
+            fprintf(stderr, "IBKeyer: Failed to compile Metal library: %s\n",
+                    err.localizedDescription.UTF8String);
+            return;
+        }
+
+        kernelFunction = [metalLibrary newFunctionWithName:[NSString stringWithUTF8String:kernelName]];
+        if (!kernelFunction) {
+            fprintf(stderr, "IBKeyer: Failed to get Metal kernel function.\n");
+            [metalLibrary release];
+            return;
+        }
+
+        pipelineState = [device newComputePipelineStateWithFunction:kernelFunction error:&err];
+        if (!pipelineState) {
+            fprintf(stderr, "IBKeyer: Failed to create Metal pipeline: %s\n",
+                    err.localizedDescription.UTF8String);
+            [metalLibrary release];
+            [kernelFunction release];
+            return;
+        }
+
+        s_PipelineQueueMap[queue] = pipelineState;
+        [metalLibrary release];
+        [kernelFunction release];
+    } else {
+        pipelineState = it->second;
+    }
+
+    lock.unlock();
+
+    // Resolve provides Metal buffers disguised as float pointers
+    id<MTLBuffer> srcDeviceBuf = reinterpret_cast<id<MTLBuffer>>(const_cast<float*>(p_Input));
+    id<MTLBuffer> dstDeviceBuf = reinterpret_cast<id<MTLBuffer>>(p_Output);
+
+    // Screen buffer: if connected use Resolve's buffer, otherwise create a tiny dummy
+    // (the kernel checks p_UseScreenInput to decide whether to read from it)
+    id<MTLBuffer> scrDeviceBuf = nil;
+    bool createdDummyScreen = false;
+    if (p_Screen && p_UseScreenInput) {
+        scrDeviceBuf = reinterpret_cast<id<MTLBuffer>>(const_cast<float*>(p_Screen));
+    } else {
+        // Create a minimal 4-float buffer so the kernel has something bound
+        float dummy[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        scrDeviceBuf = [device newBufferWithBytes:dummy length:sizeof(dummy)
+                                          options:MTLResourceStorageModeShared];
+        createdDummyScreen = true;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    commandBuffer.label = @"IBKeyerKernel";
+
+    id<MTLComputeCommandEncoder> computeEncoder = [commandBuffer computeCommandEncoder];
+    [computeEncoder setComputePipelineState:pipelineState];
+
+    // Thread group sizing — use 2D grid for image processing
+    int exeWidth = [pipelineState threadExecutionWidth];
+    int maxTotalThreads = (int)[pipelineState maxTotalThreadsPerThreadgroup];
+    int groupH = maxTotalThreads / exeWidth;
+    MTLSize threadGroupCount = MTLSizeMake(exeWidth, groupH, 1);
+    MTLSize threadGroups = MTLSizeMake(
+        (p_Width  + exeWidth - 1) / exeWidth,
+        (p_Height + groupH  - 1) / groupH,
+        1);
+
+    // Set buffers (matching kernel buffer indices)
+    [computeEncoder setBuffer:srcDeviceBuf offset:0 atIndex:0];
+    [computeEncoder setBuffer:scrDeviceBuf offset:0 atIndex:1];
+    [computeEncoder setBuffer:dstDeviceBuf offset:0 atIndex:8];
+
+    // Set scalar parameters via setBytes
+    [computeEncoder setBytes:&p_Width           length:sizeof(int)   atIndex:11];
+    [computeEncoder setBytes:&p_Height          length:sizeof(int)   atIndex:12];
+    [computeEncoder setBytes:&p_ScreenColor     length:sizeof(int)   atIndex:13];
+    [computeEncoder setBytes:&p_UseScreenInput  length:sizeof(int)   atIndex:14];
+    [computeEncoder setBytes:&p_PickR           length:sizeof(float) atIndex:15];
+    [computeEncoder setBytes:&p_PickG           length:sizeof(float) atIndex:16];
+    [computeEncoder setBytes:&p_PickB           length:sizeof(float) atIndex:17];
+    [computeEncoder setBytes:&p_Bias            length:sizeof(float) atIndex:18];
+    [computeEncoder setBytes:&p_Limit           length:sizeof(float) atIndex:19];
+    [computeEncoder setBytes:&p_RespillR        length:sizeof(float) atIndex:20];
+    [computeEncoder setBytes:&p_RespillG        length:sizeof(float) atIndex:21];
+    [computeEncoder setBytes:&p_RespillB        length:sizeof(float) atIndex:22];
+    [computeEncoder setBytes:&p_Premultiply     length:sizeof(int)   atIndex:23];
+    [computeEncoder setBytes:&p_NearGreyExtract length:sizeof(int)   atIndex:24];
+    [computeEncoder setBytes:&p_NearGreyAmount  length:sizeof(float) atIndex:25];
+
+    [computeEncoder dispatchThreadgroups:threadGroups threadsPerThreadgroup:threadGroupCount];
+    [computeEncoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+
+    if (createdDummyScreen) {
+        [scrDeviceBuf release];
+    }
+}
