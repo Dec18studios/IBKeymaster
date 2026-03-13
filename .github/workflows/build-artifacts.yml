@@ -90,6 +90,7 @@ jobs:
             build-essential \
             ca-certificates \
             cmake \
+            file \
             git
 
       - name: Configure
