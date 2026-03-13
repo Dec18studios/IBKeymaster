@@ -17,6 +17,27 @@
 #include "IBKeyerCuda.h"
 #include "ofxsLog.h"
 
+#if defined(__APPLE__)
+// Declared at global scope on purpose. When this lived inside the anonymous namespace below,
+// Clang treated it as an internal-linkage function declaration, which no longer matched the
+// real global definition in MetalKernel.mm and caused the universal macOS link to fail.
+extern void RunMetalKernel(void* p_CmdQ, int p_Width, int p_Height,
+                           int p_ScreenColor, int p_UseScreenInput,
+                           float p_PickR, float p_PickG, float p_PickB,
+                           float p_Bias, float p_Limit,
+                           float p_RespillR, float p_RespillG, float p_RespillB,
+                           int p_Premultiply, int p_NearGreyExtract,
+                           float p_NearGreyAmount, float p_NearGreySoftness,
+                           float p_BlackClip, float p_WhiteClip, float p_MatteGamma,
+                           int p_GuidedFilterEnabled, int p_GuidedRadius,
+                           float p_GuidedEpsilon, float p_GuidedMix,
+                           float p_EdgeProtect, int p_RefineIterations,
+                           float p_EdgeColorCorrect,
+                           int p_BgWrapEnabled, int p_BgWrapBlur, float p_BgWrapAmount,
+                           const float* p_Input, const float* p_Screen,
+                           const float* p_Background, float* p_Output);
+#endif
+
 namespace IBKeyerCore {
 namespace {
 
@@ -512,22 +533,6 @@ BackendResult renderHostCuda(const RenderRequest& request)
 }
 
 #if defined(__APPLE__)
-extern void RunMetalKernel(void* p_CmdQ, int p_Width, int p_Height,
-                           int p_ScreenColor, int p_UseScreenInput,
-                           float p_PickR, float p_PickG, float p_PickB,
-                           float p_Bias, float p_Limit,
-                           float p_RespillR, float p_RespillG, float p_RespillB,
-                           int p_Premultiply, int p_NearGreyExtract,
-                           float p_NearGreyAmount, float p_NearGreySoftness,
-                           float p_BlackClip, float p_WhiteClip, float p_MatteGamma,
-                           int p_GuidedFilterEnabled, int p_GuidedRadius,
-                           float p_GuidedEpsilon, float p_GuidedMix,
-                           float p_EdgeProtect, int p_RefineIterations,
-                           float p_EdgeColorCorrect,
-                           int p_BgWrapEnabled, int p_BgWrapBlur, float p_BgWrapAmount,
-                           const float* p_Input, const float* p_Screen,
-                           const float* p_Background, float* p_Output);
-
 BackendResult renderHostMetal(const RenderRequest& request)
 {
     const OfxRectI& srcBounds = request.srcImage->getBounds();
