@@ -1,0 +1,59 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-vs",
+      "displayName": "Windows VC + Ninja",
+        "generator": "Ninja",
+        "binaryDir": "${sourceDir}/build/windows-vc",
+        "cacheVariables": {
+          "CMAKE_BUILD_TYPE": "Release",
+          "IBKEYER_ENABLE_CUDA": "ON",
+          "CMAKE_CUDA_ARCHITECTURES": "75;86;89",
+          "CMAKE_CUDA_COMPILER": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/nvcc.exe",
+          "CMAKE_CUDA_FLAGS": "-allow-unsupported-compiler",
+        "CMAKE_MAKE_PROGRAM": "C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"
+      }
+    },
+    {
+      "name": "linux-ninja",
+      "displayName": "Linux Ninja",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "IBKEYER_ENABLE_CUDA": "ON"
+      }
+    },
+    {
+      "name": "macos-clang",
+      "displayName": "macOS Ninja",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+        "CMAKE_OSX_ARCHITECTURES": "arm64;x86_64"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-vs"
+    },
+    {
+      "name": "linux-release",
+      "configurePreset": "linux-ninja"
+    },
+    {
+      "name": "macos-release",
+      "configurePreset": "macos-clang"
+    }
+  ]
+}

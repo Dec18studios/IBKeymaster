@@ -675,10 +675,14 @@ void RunMetalKernel(void* p_CmdQ, int p_Width, int p_Height,
     auto it = s_QueueStateMap.find(queue);
     if (it == s_QueueStateMap.end()) {
         MTLCompileOptions* options = [MTLCompileOptions new];
+        // Keep Metal math conservative here. Fast-math is tempting, but parity debugging gets much
+        // harder when the Metal backend quietly takes a different numerical path from CPU/CUDA and
+        // from the original Gaffer graph. If we revisit this as a performance optimization later,
+        // it should be treated as a measured opt-in change rather than the default behavior.
 #if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
-        options.mathMode = MTLMathModeFast;
+        options.mathMode = MTLMathModeSafe;
 #else
-        options.fastMathEnabled = YES;
+        options.fastMathEnabled = NO;
 #endif
         id<MTLLibrary> lib = [device newLibraryWithSource:@(kernelSource) options:options error:&err];
         [options release];

@@ -1,0 +1,25 @@
+# Local build and packaging output
+/build/
+/dist/
+
+# OS/editor noise
+/.DS_Store
+
+# Legacy local backups and object files in the plugin source tree
+/IBKeymaster/*.bak
+/IBKeymaster/*.v2bak
+/IBKeymaster/*.o
+/IBKeymaster/*.obj
+/IBKeymaster/*.pdb
+/IBKeymaster/*.ilk
+/IBKeymaster/*.lib
+/IBKeymaster/*.exp
+
+# Built plugin binaries should come from CI or local packaging, not from git
+/IBKeymaster/*.ofx
+/IBKeymaster/IBKeyer.ofx.bundle/Contents/Win64/
+/IBKeymaster/IBKeyer.ofx.bundle/Contents/Linux-x86-64/
+/IBKeymaster/IBKeyer.ofx.bundle/Contents/MacOS/IBKeyer.ofx
+/IBKeymaster/IBKeymaster.ofx.bundle/Contents/Win64/
+/IBKeymaster/IBKeymaster.ofx.bundle/Contents/Linux-x86-64/
+/IBKeymaster/IBKeymaster.ofx.bundle/Contents/MacOS/IBKeymaster.ofx

@@ -1,0 +1,123 @@
+name: Build OFX Artifacts
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/build-artifacts.yml"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "build_*.sh"
+      - "configure_*.sh"
+      - "IBKeymaster/**"
+      - "OpenFX-1.4/**"
+      - "Support/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-artifacts.yml"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "build_*.sh"
+      - "configure_*.sh"
+      - "IBKeymaster/**"
+      - "OpenFX-1.4/**"
+      - "Support/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos-universal:
+    name: macOS universal
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: |
+          # One universal macOS bundle is easier for OFX distribution than separate Intel/Apple
+          # Silicon uploads, and it matches the repo's intended default CMake behavior.
+          cmake -S . -B build/macos-universal \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64\;x86_64
+
+      - name: Build
+        shell: bash
+        run: cmake --build build/macos-universal --config RelWithDebInfo --parallel
+
+      - name: Verify binary architecture
+        shell: bash
+        run: lipo -info IBKeymaster/IBKeyer.ofx.bundle/Contents/MacOS/IBKeyer.ofx
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          rm -rf artifacts/macos-universal
+          mkdir -p artifacts/macos-universal/IBKeyer-macos-universal-portable
+          cp -R IBKeymaster/IBKeyer.ofx.bundle \
+             artifacts/macos-universal/IBKeyer-macos-universal-portable/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IBKeyer-macos-universal
+          path: artifacts/macos-universal/IBKeyer-macos-universal-portable
+          if-no-files-found: error
+          retention-days: 14
+
+  build-linux:
+    name: Linux x86_64
+    runs-on: ubuntu-24.04
+    container:
+      # GitHub's standard Linux runners do not guarantee an nvcc toolchain. Building inside an
+      # NVIDIA CUDA devel image keeps the Linux artifact reproducible without needing a GPU.
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            file \
+            git
+
+      - name: Configure
+        shell: bash
+        run: cmake -S . -B build/linux-x86_64 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        shell: bash
+        run: cmake --build build/linux-x86_64 --config RelWithDebInfo --parallel
+
+      - name: Verify binary architecture
+        shell: bash
+        run: file IBKeymaster/IBKeyer.ofx.bundle/Contents/Linux-x86-64/IBKeyer.ofx
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          rm -rf artifacts/linux-x86_64
+          mkdir -p artifacts/linux-x86_64/IBKeyer-linux-x86_64-portable/IBKeyer.ofx.bundle/Contents/Linux-x86-64
+          cp IBKeymaster/IBKeyer.ofx.bundle/Contents/Linux-x86-64/IBKeyer.ofx \
+             artifacts/linux-x86_64/IBKeyer-linux-x86_64-portable/IBKeyer.ofx.bundle/Contents/Linux-x86-64/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IBKeyer-linux-x86_64
+          path: artifacts/linux-x86_64/IBKeyer-linux-x86_64-portable
+          if-no-files-found: error
+          retention-days: 14
