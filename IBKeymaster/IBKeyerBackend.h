@@ -43,6 +43,9 @@ struct DeviceRenderFrame
 {
     ImagePlaneDesc src;
     ImagePlaneDesc screen;
+    ImagePlaneDesc background;
+    ImagePlaneDesc garbageMatte;
+    ImagePlaneDesc occlusionMatte;
     MutableImagePlaneDesc dst;
     OfxRectI renderWindow = {0, 0, 0, 0};
 };
@@ -51,6 +54,9 @@ struct RenderRequest
 {
     const OFX::Image* srcImage = nullptr;
     const OFX::Image* screenImage = nullptr;
+    const OFX::Image* backgroundImage = nullptr;
+    const OFX::Image* garbageMatteImage = nullptr;
+    const OFX::Image* occlusionMatteImage = nullptr;
     OFX::Image* dstImage = nullptr;
     OfxRectI renderWindow = {0, 0, 0, 0};
     bool hostCudaEnabled = false;

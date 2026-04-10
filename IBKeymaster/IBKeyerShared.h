@@ -32,13 +32,32 @@ struct IBKeyerParams
     float respillB = 0.0f;
     bool premultiply = false;
     bool nearGreyExtract = true;
-    float nearGreyAmount = 1.0f;
+    float nearGreyAmount = 0.5f;
+    float nearGreySoftness = 1.0f;
     float blackClip = 0.0f;
     float whiteClip = 1.0f;
+    float matteGamma = 1.0f;
+    bool prematteEnabled = false;
+    int prematteBlur = 8;
+    int prematteErode = 0;
+    int prematteIterations = 1;
     bool guidedFilterEnabled = true;
+    int guidedFilterMode = 0;
     int guidedRadius = 8;
     float guidedEpsilon = 0.01f;
     float guidedMix = 1.0f;
+    float edgeProtect = 0.5f;
+    int refineIterations = 2;
+    float edgeColorCorrect = 0.0f;
+    bool bgWrapEnabled = false;
+    int bgWrapBlur = 20;
+    float bgWrapAmount = 0.5f;
+    bool additiveKeyEnabled = false;
+    int additiveKeyMode = 0;
+    float additiveKeySaturation = 0.0f;
+    float additiveKeyAmount = 0.0f;
+    bool additiveKeyBlackClamp = false;
+    int viewMode = 0;
 };
 
 struct PackedFrame
@@ -47,6 +66,9 @@ struct PackedFrame
     int height = 0;
     const float* srcRgba = nullptr;
     const float* screenRgba = nullptr;
+    const float* backgroundRgba = nullptr;
+    const float* garbageMatteRgba = nullptr;
+    const float* occlusionMatteRgba = nullptr;
     float* dstRgba = nullptr;
 };
 
@@ -87,13 +109,13 @@ IBKEYER_HOST_DEVICE inline float despillValue(float r, float g, float b, int scr
 }
 
 IBKEYER_HOST_DEVICE inline float nearGreyAlpha(float r, float g, float b, int screenColor,
-                                               float amount)
+                                               float softness)
 {
     float c0, c1, c2;
     reorderChannels(r, g, b, screenColor, c0, c1, c2);
     const float mx = fmaxf(c0, fmaxf(c1, c2));
     const float comp = (mx == c1) ? c1 : c2;
-    const float value = c0 * (1.0f - amount) + comp * amount;
+    const float value = c0 * (1.0f - softness) + comp * softness;
     return clamp01(value);
 }
 

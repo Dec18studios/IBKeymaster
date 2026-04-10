@@ -28,14 +28,99 @@ on:
 permissions:
   contents: read
 
+env:
+  CUDA_VERSION: "12.9.1"
+  CUDA_ARCHS: "60;61;75;86;89"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
+  build-windows:
+    name: Windows Win64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install CUDA Toolkit
+        # v0.2.24 only knows about CUDA 12.9.0. Updating the action keeps our requested
+        # toolkit line at 12.9.1 instead of silently downgrading it just to satisfy the installer.
+        uses: Jimver/cuda-toolkit@v0.2.29
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+
+      - name: Verify CUDA toolchain
+        shell: pwsh
+        run: |
+          & "$env:CUDA_PATH\bin\nvcc.exe" --version
+          cmake --version
+          ninja --version
+
+      - name: Enter MSVC developer environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installationPath) {
+            throw "Could not locate a Visual Studio installation with C++ tools."
+          }
+
+          $vsDevCmd = Join-Path $installationPath "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path $vsDevCmd)) {
+            throw "Could not locate VsDevCmd.bat at $vsDevCmd"
+          }
+
+          cmd /c "`"$vsDevCmd`" -arch=amd64 -host_arch=amd64 && set" |
+            ForEach-Object {
+              if ($_ -match '^(.*?)=(.*)$') {
+                "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              }
+            }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build/windows-win64 -G Ninja `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DIBKEYER_ENABLE_CUDA=ON `
+            -DCMAKE_CUDA_ARCHITECTURES="${env:CUDA_ARCHS}" `
+            -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe" `
+            -DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build/windows-win64 --config RelWithDebInfo --parallel
+
+      - name: Verify bundle
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "IBKeymaster/IBKeyer.ofx.bundle/Contents/Win64/IBKeyer.ofx")) {
+            throw "Windows OFX bundle was not produced."
+          }
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force artifacts/windows-win64 -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path artifacts/windows-win64/IBKeyer-Win64-portable | Out-Null
+          Copy-Item -Recurse "IBKeymaster/IBKeyer.ofx.bundle" "artifacts/windows-win64/IBKeyer-Win64-portable/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: IBKeyer-Win64
+          path: artifacts/windows-win64/IBKeyer-Win64-portable
+          if-no-files-found: error
+          retention-days: 14
+
   build-macos-universal:
     name: macOS universal
     runs-on: macos-14
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure
         shell: bash
@@ -64,7 +149,7 @@ jobs:
              artifacts/macos-universal/IBKeyer-macos-universal-portable/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: IBKeyer-macos-universal
           path: artifacts/macos-universal/IBKeyer-macos-universal-portable
@@ -77,11 +162,11 @@ jobs:
     container:
       # GitHub's standard Linux runners do not guarantee an nvcc toolchain. Building inside an
       # NVIDIA CUDA devel image keeps the Linux artifact reproducible without needing a GPU.
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      image: nvidia/cuda:12.9.1-devel-ubuntu22.04
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install build dependencies
         shell: bash
@@ -96,7 +181,11 @@ jobs:
 
       - name: Configure
         shell: bash
-        run: cmake -S . -B build/linux-x86_64 -DCMAKE_BUILD_TYPE=RelWithDebInfo
+        run: |
+          cmake -S . -B build/linux-x86_64 \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DIBKEYER_ENABLE_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}"
 
       - name: Build
         shell: bash
@@ -115,7 +204,7 @@ jobs:
              artifacts/linux-x86_64/IBKeyer-linux-x86_64-portable/IBKeyer.ofx.bundle/Contents/Linux-x86-64/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: IBKeyer-linux-x86_64
           path: artifacts/linux-x86_64/IBKeyer-linux-x86_64-portable

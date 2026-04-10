@@ -47,7 +47,10 @@ if(IBKEYER_ENABLE_CUDA AND (WIN32 OR (UNIX AND NOT APPLE)))
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+    # Pascal support needs sm_60/sm_61 in the fatbin, otherwise a "CUDA-enabled" build can still
+    # fail to launch on older but still very usable NVIDIA cards. Keeping this default aligned with
+    # CI artifacts avoids the trap where GitHub builds support Pascal but local builds silently do not.
+    set(CMAKE_CUDA_ARCHITECTURES 60 61 75 86 89)
   endif()
   if(WIN32)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
